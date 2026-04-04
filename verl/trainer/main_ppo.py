@@ -56,6 +56,8 @@ def run_ppo(config, task_runner_class=None) -> None:
         task_runner_class: For recipe to change TaskRunner.
     """
     # Check if Ray is not initialized
+
+    # Ray初始化
     if not ray.is_initialized():
         # Initialize Ray with a local cluster configuration
         # Set environment variables in the runtime environment to control tokenizer parallelism,
@@ -65,6 +67,7 @@ def run_ppo(config, task_runner_class=None) -> None:
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
 
+        # 数据存储的后端
         if config.transfer_queue.enable:
             # Add runtime environment variables for transfer queue
             runtime_env_vars = runtime_env_kwargs.get("env_vars", {})
@@ -81,6 +84,8 @@ def run_ppo(config, task_runner_class=None) -> None:
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
+
+    # 创建 TaskRunner 类的远程实例，并且远程执行 TaskRunner 实例的run方法并等待其完成
     if (
         is_cuda_available
         and config.global_profiler.tool == "nsys"
@@ -96,10 +101,15 @@ def run_ppo(config, task_runner_class=None) -> None:
         runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
     else:
         runner = task_runner_class.remote()
+
+    # Wait for the remote execution of the `run` method to complete and retrieve the result (if any)
+    # 等待run方法的远程执行完成并获取结果（训练结果）
     ray.get(runner.run.remote(config))
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
     # This file is used for performance analysis
+    #  从配置中获取时间线跟踪文件的路径，默认为 None
+    #  此文件用于性能分析
     timeline_json_file = config.ray_kwargs.get("timeline_json_file", None)
     if timeline_json_file:
         ray.timeline(filename=timeline_json_file)

@@ -1283,125 +1283,197 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        # 假设你在训练PPO算法时，配置文件里设置了profile step区间为[100, 200]，那么在第100步到第200步之间，系统会自动记录每个训练step的详细耗时、显存占用、数据吞吐等信息。
+        # 这样你可以发现，比如“第150步时，数据加载耗时突然变长”，从而定位到数据IO瓶颈。
+
+        # 进入主训练循环，遍历所有epoch（轮次），每个epoch代表一次完整的数据集遍历
+        # current_epoch为当前已训练的epoch数，self.config.trainer.total_epochs为总训练轮数
+        # 训练过程中会根据epoch数动态调整学习率、采样策略等
+        # 这里的for循环是训练的最外层循环
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            # 遍历训练数据集的每一个batch，self.train_dataloader为数据加载器
+            # 每个batch_dict包含一批样本的数据，供模型进行一次参数更新
             for batch_dict in self.train_dataloader:
+                # 检查actor_rollout_wg是否有异步收尾函数（如分布式rollout、推理等任务的收尾）
+                # 如果有，则在每个batch开始前异步执行一次收尾，确保上一步的异步任务能及时清理资源
+                # blocking=False表示该操作不会阻塞主训练流程，提高训练效率
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
+                # 初始化metrics字典，用于记录本batch的各类训练指标（如loss、reward等）
                 metrics = {}
+                # 初始化timing_raw字典，用于记录本batch各阶段的耗时信息，便于性能分析
                 timing_raw = {}
 
+                # 训练性能分析起始，记录profile相关的耗时信息
+                # marked_timer上下文管理器会自动统计代码块的执行时间，写入timing_raw
+                # self._start_profiling根据配置决定是否开启profile，便于后续性能调优
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
+
+                # 将原始batch_dict转换为DataProto对象，便于后续统一处理
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                # 设置采样温度参数，影响生成策略的多样性
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
                 # add uid to batch
+                # 为每个样本分配唯一的uid，便于后续追踪和数据对齐
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
+                # 根据当前batch生成用于生成任务的gen_batch，通常会包含输入prompt等信息
                 gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
+                # 记录当前全局训练步数到gen_batch，便于后续追踪
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                # 对gen_batch进行重复，repeat_times为采样次数，interleave=True表示交错排列
+                # 这样可以在一个batch内生成多个不同的采样结果，提高训练效率
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
 
+                # 判断当前是否为最后一个训练步，用于后续收尾和保存模型
                 is_last_step = self.global_steps >= self.total_training_steps
+
+
+                # 进入本batch的主训练步骤，统计整个step的耗时
                 with marked_timer("step", timing_raw):
                     # generate a batch
+                    # 生成阶段：模型根据输入生成输出序列，统计生成耗时
                     with marked_timer("gen", timing_raw, color="red"):
+                        # 若当前步需要profile，则启动异步rollout的性能分析
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
+                        # 调用异步rollout管理器生成序列，实际执行模型推理
+
+                        # ==========Rollout
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+
+                        # 让所有副本进入休眠，节省资源
                         self.checkpoint_manager.sleep_replicas()
+                        # 若当前步需要profile，则停止性能分析
                         if curr_step_profile:
                             self.async_rollout_manager.stop_profile()
 
+                        # 将生成阶段的耗时信息合并到timing_raw，便于后续统计
                         timing_raw.update(gen_batch_output.meta_info["timing"])
+                        # 移除gen_batch_output中的timing字段，避免冗余
                         gen_batch_output.meta_info.pop("timing", None)
 
+                    # 如果使用REMAX优势估计器，则需要额外生成baseline batch用于基线奖励计算
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        # 生成baseline batch，设置do_sample=False，统计其生成耗时
                         with marked_timer("gen_max", timing_raw, color="purple"):
+                            # 深拷贝gen_batch，避免影响原始数据
                             gen_baseline_batch = deepcopy(gen_batch)
+                            # 设置baseline batch为确定性采样（不加噪声）
                             gen_baseline_batch.meta_info["do_sample"] = False
+                            # 若需要profile，启动性能分析
                             if curr_step_profile:
                                 self.async_rollout_manager.start_profile()
+                            # 生成baseline输出
                             gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                            # 让副本休眠
                             self.checkpoint_manager.sleep_replicas()
+                            # 停止profile
                             if curr_step_profile:
                                 self.async_rollout_manager.stop_profile()
+                            # 将baseline输出合并到主batch，便于后续奖励对比
                             batch = batch.union(gen_baseline_output)
                             # compute reward model score on batch
+                            # 计算或提取reward model分数，若尚未计算则补充
                             rm_scores = None
                             if self.use_rm and "rm_scores" not in batch.batch.keys():
                                 batch_reward = self._compute_reward_colocate(batch)
                                 batch = batch.union(batch_reward)
 
                             # Compute or extract reward for REMAX baseline
+                            # 计算REMAX基线奖励，通常为reward model分数的和
                             reward_baseline_tensor = batch.batch["rm_scores"].sum(dim=-1)
 
+                            # 移除gen_baseline_output和rm_scores中的临时字段，避免污染主batch
                             keys_to_pop = set(gen_baseline_output.batch.keys())
                             if rm_scores is not None:
                                 keys_to_pop.update(rm_scores.batch.keys())
                             batch.pop(batch_keys=list(keys_to_pop))
 
+                            # 将基线奖励写入batch，供后续优势计算使用
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
+                            # 释放临时变量，节省内存
                             del rm_scores, gen_baseline_batch, gen_baseline_output
+                    
+                    
                     # repeat to align with repeated responses in rollout
+                    # 再次重复batch以对齐采样数量，并合并生成输出
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    # 若batch中未包含response_mask，则计算并补充
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
+                    # 若配置要求平衡batch（如多卡训练时各卡样本数对齐），则进行batch平衡
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
+                    # 统计本batch的有效token数，写入meta_info，便于后续吞吐量等指标统计
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     # get images_seqlens
+                    # 统计多模态输入中的图片序列长度信息，便于分析多模态任务的性能
                     images_seqlens_all = []
                     for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
                         if "image_grid_thw" not in multi_modal_input.keys():
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
+                    # 奖励计算阶段，统计reward相关耗时
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
+                        # ==========计算Reward
+                        # 若需要reward model且尚未计算，则补充reward分数
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(batch)
                             batch = batch.union(batch_reward)
 
                         # extract reward_tensor and reward_extra_infos_dict for training
+                        # 提取reward张量和额外奖励信息，reward_tensor用于训练，reward_extra_infos_dict便于分析
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                    # 获取rollout修正配置，判断是否采用bypass模式（直接用rollout_log_probs）
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                    # bypass 模式：直接用rollout_log_probs，不重新计算old_log_probs # 目前好像是说rollput的精度不足
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                        # 导入bypass模式处理函数
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
+                        # 应用bypass模式，将rollout_log_probs直接赋值给old_log_probs
                         apply_bypass_mode(
                             batch=batch,
                             rollout_corr_config=rollout_corr_config,
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
+                    # decoupled模式：重新计算old_log_probs，作为后续mini-batch更新的锚点
                     else:  # Recompute old_log_probs
+                        # 计算old_log_probs阶段，统计耗时
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            # 调用模型重新计算old_log_probs和推理MFU指标
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            # 计算熵指标和推理MFU，便于分析模型探索性和推理效率
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -1416,7 +1488,9 @@ class RayPPOTrainer:
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
                             metrics.update(old_log_prob_metrics)
+                            # 移除临时熵字段，避免冗余
                             old_log_prob.batch.pop("entropys")
+                            # 检查路由专家配置冲突，防止R2和R3模式混用
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 raise ValueError(
                                     "Detected conflicting router replay configuration: "
@@ -1425,47 +1499,60 @@ class RayPPOTrainer:
                                     "The enable_rollout_routing_replay option is only used in R3 mode; "
                                     "it should not be set when using R2 mode."
                                 )
+                            # 合并old_log_prob到主batch，便于后续损失计算
                             batch = batch.union(old_log_prob)
+                            # 若包含rollout_log_probs，可计算概率差异等调试指标
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
 
+                    # 确保old_log_probs已写入batch，防止后续流程出错
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
+                    # 若启用参考策略（reference policy），则计算其log_prob，便于对比
                     if self.use_reference_policy:
                         # compute reference log_prob
+                        # 计算参考策略的log_prob，统计耗时
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
+                    # 若启用critic（价值网络），则计算value，便于后续优势估计
                     if self.use_critic:
+                        # 计算value阶段，统计耗时
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self._compute_values(batch)
                             batch = batch.union(values)
 
+                    # 优势（advantage）计算阶段，统计耗时
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
+                        # 写入token级别的reward分数，供后续损失计算
                         reward_extra_infos_dict: dict[str, list]
                         batch.batch["token_level_scores"] = reward_tensor
 
+                        # 若有额外奖励信息，则写入non_tensor_batch，便于后续分析
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                         # compute rewards. apply_kl_penalty if available
+                        # 若配置要求在reward中加入KL惩罚，则调用apply_kl_penalty
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
                             )
                             metrics.update(kl_metrics)
                         else:
+                            # 否则直接用token_level_scores作为reward
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)
                         # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        # 若需要rollout修正（如重要性采样、拒绝采样等），则调用相关函数并记录指标
                         if (
                             rollout_corr_config is not None
                             and "rollout_log_probs" in batch.batch
@@ -1473,16 +1560,18 @@ class RayPPOTrainer:
                         ):
                             from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 
-                            # Compute IS weights, apply rejection sampling, compute metrics
+                            # 计算IS权重、拒绝采样并记录相关指标
                             batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
-                            # IS and off-policy metrics already have rollout_corr/ prefix
+                            # IS和off-policy相关指标以rollout_corr/为前缀
                             metrics.update(is_metrics)
 
                         # compute advantages, executed on the driver process
+                        # 获取GRPO优势归一化因子配置
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
+                        # 调用优势计算函数，得到最终的advantage，用于PPO损失
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1494,6 +1583,7 @@ class RayPPOTrainer:
                         )
 
                     # update critic
+                    # 若启用critic，则更新价值网络参数，并记录相关指标
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
@@ -1501,12 +1591,15 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
+                    # 若已过critic warmup阶段，则开始更新actor参数
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
+                        # 更新actor参数，统计耗时
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+                        # 检查ESI（弹性服务器实例）是否即将到期，若快到期则强制保存checkpoint
                         esi_close_to_expiration = should_save_ckpt_esi(
                             max_steps_duration=self.max_steps_duration,
                             redundant_time=self.config.trainer.esi_redundant_time,
@@ -1518,6 +1611,7 @@ class RayPPOTrainer:
                         # 2. It's the last training step.
                         # 3. The current step number is a multiple of the save frequency.
                         # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
+                        # 满足保存checkpoint的条件（如到达保存频率、最后一步或ESI到期），则保存模型
                         if self.config.trainer.save_freq > 0 and (
                             is_last_step
                             or self.global_steps % self.config.trainer.save_freq == 0
@@ -1529,18 +1623,22 @@ class RayPPOTrainer:
                                 self._save_checkpoint()
 
                         # update weights from trainer to rollout
+                        # 将trainer中的最新权重同步到rollout进程，保证推理和训练一致
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights(self.global_steps)
 
+                        # 记录actor更新后的各类指标
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
+                    # 若配置要求记录rollout生成数据，则保存本batch的生成信息，便于后续分析
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
+                # 满足验证条件（如到达验证频率或最后一步），则进行模型验证并记录指标
                 if self.config.trainer.test_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
@@ -1550,6 +1648,7 @@ class RayPPOTrainer:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
+                # 结束本batch的profile，更新profile状态，便于下一个batch判断是否需要profile
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
                         self.global_steps + 1 in self.config.global_profiler.steps
@@ -1564,10 +1663,12 @@ class RayPPOTrainer:
                     prev_step_profile = curr_step_profile
                     curr_step_profile = next_step_profile
 
+                # 记录本batch的step耗时，并更新最大耗时，便于ESI到期判断
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
                 # training metrics
+                # 记录全局训练步数和当前epoch到metrics，便于日志追踪
                 metrics.update(
                     {
                         "training/global_step": self.global_steps,
@@ -1575,8 +1676,10 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
+                # 统计本batch的数据相关指标（如样本数、token数等）
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 # GDPO per-component reward metrics
+                # 若使用GDPO优势估计器，则统计各reward分量的均值、方差、最大最小值
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
                 if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
                     for key in gdpo_reward_keys:
@@ -1586,25 +1689,32 @@ class RayPPOTrainer:
                             metrics[f"gdpo/{key}/std"] = float(np.std(vals))
                             metrics[f"gdpo/{key}/max"] = float(np.max(vals))
                             metrics[f"gdpo/{key}/min"] = float(np.min(vals))
+                # 统计本batch各阶段的耗时指标
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
+                # 统计吞吐量指标（如每秒处理样本数、token数等），便于性能分析
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
                 # compute variance proxy metrics
+                # 统计梯度范数等方差代理指标，便于分析训练稳定性
                 gradient_norm = metrics.get("actor/grad_norm", None)
                 metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
+                # 若使用课程学习采样器，则在每个batch后动态调整采样策略
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
 
                 # TODO: make a canonical logger that supports various backend
+                # 记录本batch的所有训练指标到日志系统，便于后续可视化和分析
                 logger.log(data=metrics, step=self.global_steps)
 
+                # 更新进度条，增加全局训练步数
                 progress_bar.update(1)
                 self.global_steps += 1
 
+                # 若配置要求记录显存快照，则在每步后保存显存信息，便于排查内存泄漏等问题
                 if (
                     hasattr(self.config.actor_rollout_ref.actor, "profiler")
                     and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
@@ -1613,6 +1723,7 @@ class RayPPOTrainer:
                         tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
                     )
 
+                # 若已到达最后一个训练步，则进行最终收尾，包括异步任务收尾、打印最终验证指标、关闭进度条并退出训练
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
@@ -1622,6 +1733,8 @@ class RayPPOTrainer:
 
                 # this is experimental and may be changed/removed in the future
                 # in favor of a general-purpose data buffer pool
+                # 若数据集实现了on_batch_end钩子，则在每个batch后调用，便于动态数据增强或采样策略调整
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+ 
