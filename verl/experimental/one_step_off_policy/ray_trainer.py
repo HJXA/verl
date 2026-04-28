@@ -41,6 +41,7 @@ from verl.trainer.ppo.ray_trainer import (
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.debug import marked_timer
+from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.tracking import ValidationGenerationsLogger
 
@@ -115,7 +116,6 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
-        self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -178,7 +178,13 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
-        from verl.experimental.agent_loop import AgentLoopManager
+
+        # Support custom AgentLoopManager via config
+        manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
+        if manager_class_fqn:
+            AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+        else:
+            from verl.experimental.agent_loop import AgentLoopManager
 
         self.async_rollout_mode = True
         self.async_rollout_manager = AgentLoopManager.create(
@@ -363,8 +369,6 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             await asyncio.sleep(0)
             batch = self._fit_update_actor(batch)
             await asyncio.sleep(0)
-            self._fit_update_weights()
-            await asyncio.sleep(0)
             self._fit_dump_data(batch)
             await asyncio.sleep(0)
 
@@ -374,7 +378,6 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         await asyncio.sleep(0)
         self._fit_stop_profile()
         self._fit_collect_metrics(batch)
-        self._fit_torch_memory()
         self._fit_experimental(batch)
         self._fit_postprocess_step()
 
